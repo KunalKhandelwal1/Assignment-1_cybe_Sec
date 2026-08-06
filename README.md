@@ -10,9 +10,9 @@ and view an encrypted message flow on their own page.
 The project is built as a small Express app with a SQLite database and
 browser-side crypto for the message feature.
 
-![Architecture before](../before.png)
+![Architecture before](before.png)
 
-![Architecture after](../after.png)
+![Architecture after](after.png)
 
 ## Features
 
