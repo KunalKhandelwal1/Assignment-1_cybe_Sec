@@ -1,13 +1,25 @@
 # CS_Lab_1
 
-A simple class portal where students can log in, set a fun personal
-message on their page, and update their password.
+Video demonstration: https://drive.google.com/file/d/1GXxJ4OALZJAgupHLm78vAKwjd7UZBaZX/view?usp=sharing
+
+A simple class portal where students can log in, set a personal message,
+and view an encrypted message flow on their own page.
+
+## Architecture
+
+The project is built as a small Express app with a SQLite database and
+browser-side crypto for the message feature.
+
+![Architecture before](../before.png)
+
+![Architecture after](../after.png)
 
 ## Features
 
 - Log in with a username and password
 - View your own page with a welcome message
-- Set a short personal message that shows up on your page
+- Set a personal message through the encrypted message flow
+- Unlock the stored message client-side with the correct password
 - Change your password any time
 
 ## Tech Stack
@@ -15,6 +27,7 @@ message on their page, and update their password.
 - [Node.js](https://nodejs.org/) with [Express](https://expressjs.com/)
 - [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) for storage
 - Plain HTML/CSS, no front-end framework
+- Browser Web Crypto API for hashing, encryption, and decryption
 
 ## Getting Started
 
@@ -48,7 +61,8 @@ classmate-hub/
 │   ├── message.js         # set message page
 │   └── password.js        # change password page
 └── public/
-    └── style.css           # styling
+    ├── crypto.js          # browser crypto helpers
+    └── style.css          # styling
 ```
 
 ## Configuration

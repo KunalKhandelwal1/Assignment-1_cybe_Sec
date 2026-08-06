@@ -14,8 +14,17 @@ router.get("/account", (req, res) => {
     return res.redirect("/");
   }
 
-  const messageBlock = me.message
-    ? `<div class="message-box">💬 <strong>${me.display_name}'s message:</strong><br>${me.message}</div>`
+  const messageBlock = me.message_ciphertext && me.message_iv
+    ? `
+      <div class="message-box" id="locked-message" data-ciphertext="${me.message_ciphertext}" data-iv="${me.message_iv}">
+        <div id="lock-state">🔒 Message locked</div>
+        <label for="unlock-password">Password</label>
+        <input type="password" id="unlock-password" placeholder="Enter the message password" autofocus>
+        <button type="button" id="unlock-button" class="btn btn-yellow">Unlock</button>
+        <div id="unlock-status" class="subtitle"></div>
+        <div id="unlocked-message" class="message-box empty" style="display:none; white-space: pre-wrap;"></div>
+      </div>
+    `
     : `<div class="message-box empty">💬 No message set yet.</div>`;
 
   res.send(page("My Page", `
@@ -26,6 +35,36 @@ router.get("/account", (req, res) => {
       <a href="/change-password" class="btn btn-green">🔑 Change Password</a>
     </div>
     <a href="/logout" class="btn btn-pink" style="margin-top: 14px; display:inline-block;">Log Out</a>
+    <script src="/public/crypto.js"></script>
+    <script>
+      (function () {
+        const lockedMessage = document.getElementById("locked-message");
+        if (!lockedMessage) {
+          return;
+        }
+
+        const unlockButton = document.getElementById("unlock-button");
+        const passwordInput = document.getElementById("unlock-password");
+        const unlockStatus = document.getElementById("unlock-status");
+        const unlockedMessage = document.getElementById("unlocked-message");
+        const ciphertext = lockedMessage.dataset.ciphertext;
+        const iv = lockedMessage.dataset.iv;
+
+        unlockButton.addEventListener("click", async () => {
+          unlockStatus.textContent = "Decrypting locally...";
+
+          try {
+            const plaintext = await window.ClassmateCrypto.decryptMessage(ciphertext, iv, passwordInput.value);
+            unlockedMessage.textContent = plaintext;
+            unlockedMessage.style.display = "block";
+            unlockStatus.textContent = "";
+            lockedMessage.querySelector("#lock-state").textContent = "🔓 Message unlocked";
+          } catch (error) {
+            unlockStatus.textContent = "Wrong password or corrupted message.";
+          }
+        });
+      })();
+    </script>
   `));
 });
 
