@@ -22,7 +22,8 @@ from views import page
 PQC_KEM_ALGORITHMS = ("ML-KEM-768", "Kyber768")  # preferred first
 PQC_KEM_ALGORITHM = "ML-KEM-768"
 
-# HKDF info string for domain separation. Must match crypto.js HKDF_INFO_STRING.
+# HKDF info string for domain separation (must match crypto.js HKDF_INFO_STRING).
+# Ensures same shared secret derives distinct keys across different applications.
 HKDF_INFO = b"ClassmateHub-ML-KEM-768-AES-256-GCM-v1"
 
 # FIPS 203 ML-KEM-768 sizes (bytes).
@@ -49,7 +50,7 @@ def _resolve_kem_algorithm():
 
 
 def _pem_encode(label, raw: bytes) -> str:
-    # PEM = base64 of raw key bytes in 64-char lines with BEGIN/END headers.
+    # PEM = base64 of raw key bytes with BEGIN/END headers (allows raw binary keys to be saved as text files).
     b64 = base64.b64encode(raw).decode()
     lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
     return f"-----BEGIN {label}-----\n" + "\n".join(lines) + f"\n-----END {label}-----"
@@ -91,6 +92,7 @@ def _parse_pqc_private_key(pem_text: str) -> bytes:
 
 def hkdf_sha256(ikm: bytes, salt: bytes = b"", info: bytes = HKDF_INFO, length: int = 32) -> bytes:
     """HKDF-SHA256 (RFC 5869) key derivation.
+    Extracts & stretches the raw KEM shared secret into a clean, uniform AES key.
     Extract: PRK = HMAC-SHA256(salt or 32 zero bytes, IKM)
     Expand:  T(i) = HMAC(PRK, T(i-1) || info || byte(i)); output = T(1)|T(2)|...[:length]
     Matches crypto.js hkdfSha256() exactly (same salt/info/length).
@@ -109,9 +111,9 @@ def hkdf_sha256(ikm: bytes, salt: bytes = b"", info: bytes = HKDF_INFO, length: 
 
 
 def derive_aes_key(shared_secret: bytes) -> bytes:
-    """Derive AES-256-GCM key from 32-byte KEM shared secret via HKDF-SHA256.
-    HKDF adds domain separation (same secret → different key in another app context).
-    Matches crypto.js deriveAesKey() with the same info string.
+    """Derive 32-byte AES-256-GCM key from 32-byte KEM shared secret via HKDF-SHA256.
+    Wraps HKDF with fixed domain info (same secret → different key in another app context).
+    Matches crypto.js deriveAesKey().
     """
     if len(shared_secret) != ML_KEM_768_SHARED_SECRET_BYTES:
         raise ValueError("Invalid ML-KEM-768 shared secret length")
