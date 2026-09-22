@@ -1,3 +1,6 @@
+// db.js — SQLite setup using better-sqlite3.
+// Creates/migrates the accounts table (adds ciphertext/iv/kem_ct/filename columns if missing).
+// Seeds 5 demo accounts; COALESCE upsert preserves existing encrypted blobs across restarts.
 const path = require("path");
 const fs = require("fs");
 const Database = require("better-sqlite3");

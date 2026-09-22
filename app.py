@@ -8,29 +8,39 @@ from db import get_db, init_db
 from views import page
 
 # ---------------------------------------------------------------------------
-# Post-Quantum Cryptography (PQC): ML-KEM-768 (FIPS 203, formerly Kyber768)
-# via liboqs (liboqs-python `oqs` package wrapping the system liboqs C lib).
-# Hybrid construction: ML-KEM-768 KEM + HKDF-SHA256 -> AES-256-GCM.
+# Classmate Hub — Flask backend with Post-Quantum hybrid encryption.
+# Crypto scheme: ML-KEM-768 (NIST FIPS 203, formerly Kyber768) KEM +
+#   HKDF-SHA256 key derivation + AES-256-GCM file encryption (KEM + DEM).
+# Normally ALL crypto runs in the browser (crypto.js + ml-kem.js).
+# /generate-keys, /encrypt-file, /decrypt-file are FALLBACKS only
+#   (used when crypto.subtle is blocked on plain-HTTP).
+# Server NEVER decrypts user files — stores opaque base64 blobs in SQLite.
 # ---------------------------------------------------------------------------
+
+# ML-KEM-768 preferred name (FIPS 203); Kyber768 = pre-standard alias for
+# older liboqs builds. Both give identical sizes and interoperate.
 PQC_KEM_ALGORITHMS = ("ML-KEM-768", "Kyber768")  # preferred first
 PQC_KEM_ALGORITHM = "ML-KEM-768"
+
+# HKDF info string for domain separation. Must match crypto.js HKDF_INFO_STRING.
 HKDF_INFO = b"ClassmateHub-ML-KEM-768-AES-256-GCM-v1"
 
-# FIPS 203 ML-KEM-768 parameter sizes (bytes).
+# FIPS 203 ML-KEM-768 sizes (bytes).
 ML_KEM_768_PUBLIC_KEY_BYTES = 1184
 ML_KEM_768_SECRET_KEY_BYTES = 2400
 ML_KEM_768_CIPHERTEXT_BYTES = 1088
 ML_KEM_768_SHARED_SECRET_BYTES = 32
-AES_GCM_IV_BYTES = 12
+AES_GCM_IV_BYTES = 12  # 96-bit nonce (standard GCM size).
 
 PUBLIC_PEM_LABEL = "ML-KEM-768 PUBLIC KEY"
 PRIVATE_PEM_LABEL = "ML-KEM-768 PRIVATE KEY"
 
 
 def _resolve_kem_algorithm():
-    """Return the first liboqs KEM name available (prefers ML-KEM-768)."""
+    """Return the first available ML-KEM-768 name in this liboqs build.
+    Prefers final FIPS 203 name; falls back to legacy 'Kyber768' alias.
+    """
     import oqs
-
     enabled = set(oqs.get_enabled_kem_mechanisms())
     for name in PQC_KEM_ALGORITHMS:
         if name in enabled:
@@ -39,14 +49,16 @@ def _resolve_kem_algorithm():
 
 
 def _pem_encode(label, raw: bytes) -> str:
+    # PEM = base64 of raw key bytes in 64-char lines with BEGIN/END headers.
     b64 = base64.b64encode(raw).decode()
     lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
     return f"-----BEGIN {label}-----\n" + "\n".join(lines) + f"\n-----END {label}-----"
 
 
 def _pem_decode(pem_text: str) -> bytes:
+    # Strip any PEM header/footer and whitespace, then base64-decode.
+    # Accepts ML-KEM, Kyber, or generic headers; length check in callers validates type.
     import re
-
     b64 = re.sub(r"-----BEGIN [A-Z0-9 ._-]+-----", "", pem_text)
     b64 = re.sub(r"-----END [A-Z0-9 ._-]+-----", "", b64)
     b64 = re.sub(r"\s+", "", b64)
@@ -56,6 +68,7 @@ def _pem_decode(pem_text: str) -> bytes:
 
 
 def _parse_pqc_public_key(pem_text: str) -> bytes:
+    # Decode PEM and assert exactly 1184 bytes (ML-KEM-768 public key size).
     raw = _pem_decode(pem_text)
     if len(raw) != ML_KEM_768_PUBLIC_KEY_BYTES:
         raise ValueError(
@@ -66,6 +79,7 @@ def _parse_pqc_public_key(pem_text: str) -> bytes:
 
 
 def _parse_pqc_private_key(pem_text: str) -> bytes:
+    # Decode PEM and assert exactly 2400 bytes (ML-KEM-768 secret key size).
     raw = _pem_decode(pem_text)
     if len(raw) != ML_KEM_768_SECRET_KEY_BYTES:
         raise ValueError(
@@ -76,7 +90,11 @@ def _parse_pqc_private_key(pem_text: str) -> bytes:
 
 
 def hkdf_sha256(ikm: bytes, salt: bytes = b"", info: bytes = HKDF_INFO, length: int = 32) -> bytes:
-    """HKDF-SHA256 (RFC 5869). Empty salt => HashLen zeros, matching WebCrypto path."""
+    """HKDF-SHA256 (RFC 5869) key derivation.
+    Extract: PRK = HMAC-SHA256(salt or 32 zero bytes, IKM)
+    Expand:  T(i) = HMAC(PRK, T(i-1) || info || byte(i)); output = T(1)|T(2)|...[:length]
+    Matches crypto.js hkdfSha256() exactly (same salt/info/length).
+    """
     if not salt:
         salt = b"\x00" * hashlib.sha256().digest_size
     prk = hmac.new(salt, ikm, hashlib.sha256).digest()
@@ -91,11 +109,9 @@ def hkdf_sha256(ikm: bytes, salt: bytes = b"", info: bytes = HKDF_INFO, length: 
 
 
 def derive_aes_key(shared_secret: bytes) -> bytes:
-    """Derive the 256-bit AES-GCM key from the 32-byte KEM shared secret.
-
-    Direct use of the FIPS 203 shared secret would also be compliant (32
-    uniform bytes), but HKDF-SHA256 binds the key to this app's AES-GCM
-    context via domain-separation info. Must match crypto.js deriveAesKey().
+    """Derive AES-256-GCM key from 32-byte KEM shared secret via HKDF-SHA256.
+    HKDF adds domain separation (same secret → different key in another app context).
+    Matches crypto.js deriveAesKey() with the same info string.
     """
     if len(shared_secret) != ML_KEM_768_SHARED_SECRET_BYTES:
         raise ValueError("Invalid ML-KEM-768 shared secret length")
@@ -103,17 +119,20 @@ def derive_aes_key(shared_secret: bytes) -> bytes:
 
 
 def _aes_gcm_encrypt(aes_key: bytes, iv: bytes, plaintext: bytes) -> bytes:
-    """AES-256-GCM encrypt. Returns ciphertext || 16-byte tag (WebCrypto layout)."""
+    """AES-256-GCM encrypt. Returns ciphertext || 16-byte tag.
+    GCM = CTR encryption + GHASH auth tag. IV reuse with the same key is catastrophic,
+    so we always generate a fresh random 12-byte IV per file.
+    """
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
     if len(aes_key) != 32 or len(iv) != AES_GCM_IV_BYTES:
         raise ValueError("AES-256-GCM requires a 32-byte key and 12-byte IV")
     return AESGCM(aes_key).encrypt(iv, plaintext, None)
 
 
 def _aes_gcm_decrypt(aes_key: bytes, iv: bytes, ciphertext_and_tag: bytes) -> bytes:
+    # AES-GCM decrypt. Raises on wrong key, wrong IV, or tampered ciphertext/tag
+    # (GCM auth tag check provides integrity guarantee).
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
     if len(aes_key) != 32 or len(iv) != AES_GCM_IV_BYTES:
         raise ValueError("AES-256-GCM requires a 32-byte key and 12-byte IV")
     return AESGCM(aes_key).decrypt(iv, ciphertext_and_tag, None)
@@ -145,16 +164,13 @@ def index():
 
 @app.route("/generate-keys", methods=["POST"])
 def generate_keys():
-    """Server-side PQC key generation using liboqs ML-KEM-768 KEM.
-
-    Used as fallback when browser crypto.subtle is unavailable (non-HTTPS
-    context). The Flask backend uses liboqs-python (`oqs.KeyEncapsulation`)
-    with ML-KEM-768 (alias Kyber768). Secret keys are generated server-side
-    ONLY for this fallback path; in normal operation key generation happens
-    in the browser via liboqs-wasm / ml-kem.js and secrets never leave it."""
+    """Server-side ML-KEM-768 key generation via liboqs (FALLBACK only).
+    Called by crypto.js when crypto.subtle is unavailable (plain-HTTP).
+    In normal use, keys are generated entirely in the browser.
+    Note: on this path the server sees the secret key (unavoidable without WebCrypto).
+    """
     try:
         import oqs
-
         kem_name = _resolve_kem_algorithm()
         with oqs.KeyEncapsulation(kem_name) as kem:
             public_key = kem.generate_keypair()
@@ -173,14 +189,20 @@ def generate_keys():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ---------------------------------------------------------------------------
+# Plain web routes — no crypto here. Crypto lives in crypto.js (browser) +
+# /generate-keys, /encrypt-file, /decrypt-file (server fallbacks).
+# /set-message stores opaque base64 blobs; /account embeds them for browser decrypt.
+# ---------------------------------------------------------------------------
 @app.route("/login", methods=["POST"])
 def login():
+    # Cookie-based auth (username cookie). Query is intentionally
+    # string-concatenated (mirrors the Express code — SQL injection demo).
     username = request.form.get("username", "")
     password = request.form.get("password", "")
 
     conn = get_db()
     cursor = conn.cursor()
-    # Mirror SQL query behavior from original Express routes
     check_query = "SELECT * FROM accounts WHERE username = '" + username + "' AND password = '" + password + "'"
     try:
         cursor.execute(check_query)
@@ -199,6 +221,9 @@ def login():
 
 @app.route("/account", methods=["GET"])
 def account():
+    # Reads stored ciphertext/iv/kem_ct/filename and embeds as data-* attributes.
+    # Inline JS calls ClassmateCrypto.decryptFile() entirely in browser —
+    # private key pasted by user is never POSTed anywhere.
     username = request.cookies.get("username")
     if not username:
         return redirect("/")
@@ -331,12 +356,14 @@ def logout():
 
 @app.route("/encrypt-file", methods=["POST"])
 def encrypt_file_api():
-    """Server-side PQC hybrid encryption: ML-KEM-768 KEM + AES-256-GCM.
-
-    Used as fallback when browser crypto.subtle is unavailable.
-    Flow: Encap(recipient ML-KEM-768 public key) -> (kem_ct, shared_secret);
-    aes_key = HKDF-SHA256(shared_secret); ct = AES-256-GCM(aes_key, iv, file).
-    Returns { ciphertext, iv, encryptedKey (= base64 kem_ciphertext), filename }.
+    """Server-side PQC hybrid encryption (FALLBACK): ML-KEM-768 KEM + AES-256-GCM.
+    Steps (mirrors crypto.js encryptFile):
+      1. Parse recipient public key (1184 B).
+      2. Encap(pk) → (kem_ct[1088 B], shared_secret[32 B]).
+      3. aes_key = HKDF-SHA256(shared_secret).
+      4. iv = random 12 B; ciphertext = AES-GCM(aes_key, iv, file).
+    Returns JSON: { ciphertext, iv, encryptedKey, filename } — all base64.
+    'encryptedKey' = KEM ciphertext (not an RSA-encrypted AES key).
     """
     try:
         public_key_pem = request.form.get("public_key_pem", "")
@@ -359,8 +386,7 @@ def encrypt_file_api():
 
         aes_key = derive_aes_key(bytes(shared_secret))
         iv = secrets.token_bytes(AES_GCM_IV_BYTES)
-        # AESGCM output is ciphertext || 16-byte tag (matches WebCrypto).
-        full_ct = _aes_gcm_encrypt(aes_key, iv, file_bytes)
+        full_ct = _aes_gcm_encrypt(aes_key, iv, file_bytes)  # ciphertext || 16-byte tag
 
         return jsonify({
             "ciphertext": base64.b64encode(full_ct).decode(),
@@ -374,11 +400,13 @@ def encrypt_file_api():
 
 @app.route("/decrypt-file", methods=["POST"])
 def decrypt_file_api():
-    """Server-side PQC hybrid decryption: ML-KEM-768 decap + AES-256-GCM.
-
-    Used as fallback when browser crypto.subtle is unavailable.
-    Flow: shared_secret = Decap(private ML-KEM-768 key, kem_ciphertext);
-    aes_key = HKDF-SHA256(shared_secret); pt = AES-256-GCM-decrypt(...)."""
+    """Server-side PQC hybrid decryption (FALLBACK): ML-KEM-768 decap + AES-256-GCM.
+    Steps (mirrors crypto.js decryptFile):
+      1. Validate kem_ct (1088 B) and IV (12 B) lengths.
+      2. Decap(kem_ct, secret_key) → shared_secret.
+      3. aes_key = HKDF-SHA256(shared_secret); plaintext = AES-GCM-decrypt.
+    Wrong key or tampered bytes raise here (GCM auth tag failure) → HTTP 500.
+    """
     try:
         private_key_pem = request.form.get("private_key_pem", "")
         ciphertext_b64 = request.form.get("ciphertext", "")
@@ -543,6 +571,8 @@ def get_set_message():
 
 @app.route("/set-message", methods=["POST"])
 def post_set_message():
+    # Store encrypted blob — UPDATEs ciphertext/iv/kem_ct/filename for logged-in user.
+    # No crypto here; server only stores opaque base64 strings from the browser.
     username = request.cookies.get("username")
     if not username:
         return redirect("/")

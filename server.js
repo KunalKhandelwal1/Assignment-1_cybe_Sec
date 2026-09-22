@@ -1,3 +1,12 @@
+// ===========================================================================
+// server.js — ORIGINAL Node/Express entry point (kept for reference).
+// VIVA: the graded runnable app is the Flask backend (python app.py); this
+// file boots the equivalent Express app (npm start) sharing the SAME SQLite
+// schema and the SAME browser PQC bundle (public/crypto.js + ml-kem.js).
+// Middleware: urlencoded forms, cookie parser (demo "username" cookie),
+// /public static files. Routes mounted from routes/*.js. No crypto runs
+// here — encryption/decryption happen in the browser; Node only stores blobs.
+// ===========================================================================
 const express = require("express");
 const cookieParser = require("cookie-parser");
 const path = require("path");

@@ -1,57 +1,34 @@
-/* Classmate Hub — Post-Quantum hybrid encryption (ML-KEM-768 + AES-256-GCM).
+/*
+ * Classmate Hub — Client-side PQC crypto (ML-KEM-768 + AES-256-GCM).
  *
- * PQC migration: RSA-OAEP-2048 PKE has been replaced with the NIST FIPS 203
- * Key Encapsulation Mechanism ML-KEM-768 (formerly Kyber768, NIST level 3).
+ * Flow: Encap(recipient_pk) → (kem_ct, shared_secret)
+ *       aes_key = HKDF-SHA256(shared_secret, info="ClassmateHub-...-v1")
+ *       ciphertext = AES-256-GCM(aes_key, 12-byte IV, file)
  *
- * Hybrid KEM flow (PKE -> KEM paradigm shift):
- *   1. Recipient holds an ML-KEM-768 keypair (public 1184 B, secret 2400 B).
- *   2. Sender runs KEM encapsulation with the recipient public key ->
- *      (kem_ciphertext[1088 B], shared_secret[32 B]).
- *   3. A 256-bit AES key is derived from shared_secret via HKDF-SHA256 with a
- *      domain-separation info string (direct 32-byte use would also be
- *      compliant since FIPS 203 outputs 32 uniform bytes, but HKDF binds the
- *      key to this application context).
- *   4. File bytes are encrypted with AES-256-GCM + random 12-byte IV.
- *   5. POST { ciphertext, iv, encrypted_key (= kem_ciphertext), filename }
- *      to /set-message. Decapsulation + AES-GCM decrypt recovers the file.
- *
- * Client-side integration (liboqs):
- *   - Preferred: liboqs-wasm / oqs.js WebAssembly build if present
- *     (window.OQS / window.liboqs / window.oqs with a KEM interface).
- *   - Bundled fallback: public/ml-kem.js — a browser IIFE bundle of the
- *     FIPS 203 ML-KEM-768 implementation (same KAT-verified logic as liboqs,
- *     interoperable with liboqs-python's oqs.KeyEncapsulation("ML-KEM-768")).
- *     Load it BEFORE this file:
- *       <script src="/public/ml-kem.js"></script>
- *       <script src="/public/crypto.js"></script>
- *   - Key generation, encapsulation and decapsulation always occur in browser
- *     memory. Secret (private) keys NEVER leave the browser and are never
- *     POSTed to the server. The server only stores ciphertext/iv/kem_ct.
- *
- * Server-side fallback (non-secure HTTP context where crypto.subtle is
- * unavailable): POST /generate-keys, /encrypt-file, /decrypt-file implement
- * the identical KEM + HKDF + AES-GCM flow in Python via liboqs-python (oqs).
+ * Key sizes: pk=1184B, sk=2400B, kem_ct=1088B, secret=32B, IV=12B, tag=16B.
+ * Private key NEVER leaves the browser. ml-kem.js must load before this file.
+ * Fallback: if crypto.subtle unavailable (plain HTTP), POSTs to Flask routes.
  */
 (function () {
     "use strict";
 
     // ------------------------------------------------------------------ constants
-    /** KEM algorithm: ML-KEM-768 (FIPS 203, formerly Kyber768). Alias "Kyber768" accepted. */
+    /** KEM algorithm: ML-KEM-768 (NIST FIPS 203, formerly Kyber768, security level 3). */
     var KEM_ALGORITHM = "ML-KEM-768";
     var KEM_ALIAS_KYBER768 = "Kyber768";
-    /** Domain-separation info for HKDF-SHA256 -> AES-256 key derivation. Must match server (app.py). */
+    /** HKDF info string for domain separation. Must match app.py exactly. */
     var HKDF_INFO_STRING = "ClassmateHub-ML-KEM-768-AES-256-GCM-v1";
-    /** FIPS 203 ML-KEM-768 sizes (bytes). */
+    /** ML-KEM-768 key/ciphertext sizes (bytes). */
     var ML_KEM_768_PUBLIC_KEY_BYTES = 1184;
     var ML_KEM_768_SECRET_KEY_BYTES = 2400;
     var ML_KEM_768_CIPHERTEXT_BYTES = 1088;
     var ML_KEM_768_SHARED_SECRET_BYTES = 32;
-    /** AES-256-GCM IV size. */
+    /** AES-256-GCM IV size (96-bit nonce). */
     var AES_GCM_IV_BYTES = 12;
 
     var PUBLIC_PEM_LABEL = "ML-KEM-768 PUBLIC KEY";
     var PRIVATE_PEM_LABEL = "ML-KEM-768 PRIVATE KEY";
-    // Backwards-compatible labels also accepted on import.
+    // Accept legacy Kyber/generic PEM headers on import for compatibility.
     var PUBLIC_PEM_LABEL_ALIASES = [
         "ML-KEM-768 PUBLIC KEY",
         "KYBER768 PUBLIC KEY",
@@ -121,6 +98,7 @@
     }
 
     // ------------------------------------------------------------------ PEM codec (PQC)
+    /** Wrap raw key bytes in PEM BEGIN/END headers (64-char base64 lines). */
     function pemEncode(label, rawBytes) {
         var b64 = arrayBufferToBase64(rawBytes);
         var formatted = b64.match(/.{1,64}/g).join("\n");
@@ -135,6 +113,7 @@
         return pemEncode(PRIVATE_PEM_LABEL, rawSecretKeyBytes);
     }
 
+    /** Strip PEM headers/footers and whitespace, return raw base64 string. */
     function pemToBase64(pem) {
         return String(pem)
             .replace(/-----BEGIN [A-Z0-9 ._-]+-----/g, "")
@@ -142,17 +121,14 @@
             .replace(/[\r\n\s]/g, "");
     }
 
-    /**
-     * Decode a PQC PEM (or raw base64) to raw key bytes.
-     * Accepts ML-KEM-768 headers, Kyber768 headers, legacy generic headers,
-     * and header-less base64 for robustness.
-     */
+    /** Decode PEM (or raw base64) to raw key bytes. Accepts ML-KEM/Kyber/generic headers. */
     function pemToRawBytes(pem) {
         var b64 = pemToBase64(pem);
         if (!b64) throw new Error("Empty key: expected a PEM-encoded ML-KEM-768 key.");
         return base64ToBytes(b64);
     }
 
+    /** Parse and validate a public key PEM — must be exactly 1184 bytes. */
     function parsePublicKeyPem(pem) {
         var raw = pemToRawBytes(pem);
         if (raw.length !== ML_KEM_768_PUBLIC_KEY_BYTES) {
@@ -164,6 +140,7 @@
         return raw;
     }
 
+    /** Parse and validate a private key PEM — must be exactly 2400 bytes. */
     function parsePrivateKeyPem(pem) {
         var raw = pemToRawBytes(pem);
         if (raw.length !== ML_KEM_768_SECRET_KEY_BYTES) {
@@ -175,8 +152,7 @@
         return raw;
     }
 
-    // Backwards-compatible names (previously RSA SPKI/PKCS8 CryptoKeys).
-    // They now operate on ML-KEM-768 raw bytes and PEM.
+    // Previously handled RSA CryptoKeys; now operate on ML-KEM-768 raw bytes/PEM.
     async function exportPublicKeyToPem(keyOrBytes) {
         if (keyOrBytes instanceof Uint8Array) return encodePublicKeyToPem(keyOrBytes);
         throw new Error("exportPublicKeyToPem: PQC mode expects ML-KEM-768 raw public-key bytes (Uint8Array).");
@@ -198,18 +174,11 @@
     // ------------------------------------------------------------------ KEM backend (liboqs)
     /**
      * Resolve a browser-side ML-KEM-768 implementation.
-     *
-     * Preference order:
-     *   1. liboqs-wasm / oqs.js WebAssembly build (window.OQS / window.liboqs /
-     *      window.oqs exposing KeyEncapsulation/KEM for "ML-KEM-768"/"Kyber768").
-     *   2. Bundled pure-JS FIPS 203 build from /public/ml-kem.js
-     *      (window.MlKem768, interoperable with liboqs).
-     *
-     * Returns an object { generateKeyPair(), encap(publicKey), decap(ciphertext, secretKey) }
-     * operating on Uint8Array with the FIPS 203 sizes above.
+     * Priority: 1) liboqs-wasm (window.OQS/liboqs/oqs), 2) bundled ml-kem.js (window.MlKem768).
+     * Returns { generateKeyPair(), encap(publicKey), decap(ciphertext, secretKey) } on Uint8Array.
      */
     async function resolveKem() {
-        // --- 1. liboqs-wasm / oqs.js adapter ---------------------------------
+        // 1. liboqs-wasm adapter
         var oqsGlobal = null;
         if (typeof window !== "undefined") {
             oqsGlobal = window.OQS || window.liboqs || window.oqs || null;
@@ -219,7 +188,7 @@
             if (liboqsKem) return liboqsKem;
         }
 
-        // --- 2. Bundled ml-kem.js (window.MlKem768) ---------------------------
+        // 2. Bundled ml-kem.js (window.MlKem768)
         var MlKem768Ctor =
             (typeof window !== "undefined" && (window.MlKem768 || window.MLKEM768)) ||
             (typeof globalThis !== "undefined" && (globalThis.MlKem768 || globalThis.MLKEM768)) ||
@@ -262,11 +231,10 @@
     }
 
     /**
-     * Best-effort adapter for liboqs-wasm / oqs.js globals.
-     * Supports the common shapes:
-     *   - OQS.KeyEncapsulation("ML-KEM-768") with generate_keypair/encap_secret/decap_secret
-     *   - OQS.KEM("ML-KEM-768") / new OQS.KEM(...) with keypair/encaps/decaps
-     * Returns null when the global does not expose a usable KEM.
+     * Adapter for liboqs-wasm/oqs.js globals.
+     * Shape A: OQS.KeyEncapsulation (generate_keypair/encap_secret/decap_secret).
+     * Shape B: OQS.KEM (keypair/encaps/decaps).
+     * Returns null if no usable KEM is found.
      */
     function tryWrapLiboqsWasm(oqsGlobal) {
         function pickAlgName() {
@@ -372,9 +340,8 @@
     }
 
     /**
-     * HKDF-SHA256 (RFC 5869) used to derive the 256-bit AES key from the KEM
-     * shared_secret. Parameters mirror the Python backend (app.py):
-     *   salt = b"" (RFC: HashLen zeros), info = HKDF_INFO_STRING, L = 32.
+     * HKDF-SHA256 (RFC 5869): Extract → PRK = HMAC(salt, IKM); Expand → T(i) = HMAC(PRK, T(i-1)||info||i).
+     * Empty salt is replaced by 32 zero bytes per RFC. Matches app.py hkdf_sha256().
      */
     async function hkdfSha256(ikmBytes, saltBytes, infoBytes, length) {
         var salt = saltBytes && saltBytes.length ? saltBytes : new Uint8Array(32);
@@ -396,10 +363,8 @@
     }
 
     /**
-     * Derive the AES-256-GCM key from a 32-byte ML-KEM shared secret.
-     * Direct use of the shared secret would also be compliant (FIPS 203
-     * guarantees 32 uniform bytes), but HKDF-SHA256 adds domain separation
-     * for this application's AES-GCM context.
+     * Derive AES-256-GCM key from 32-byte KEM shared secret via HKDF-SHA256.
+     * HKDF adds domain separation (same secret → different key in different apps).
      */
     async function deriveAesKey(sharedSecret) {
         if (sharedSecret.length !== ML_KEM_768_SHARED_SECRET_BYTES) {
@@ -424,13 +389,11 @@
 
     // ------------------------------------------------------------------ public API
     /**
-     * Generate an ML-KEM-768 keypair entirely in the browser.
-     * The secret key never leaves browser memory; only the user downloading
-     * private_key.pqc moves it (as a local file).
+     * Generate ML-KEM-768 keypair in-browser. Private key never leaves browser memory.
+     * Fallback: if no crypto.subtle or KEM backend, delegates to Flask /generate-keys.
      */
     async function generateKeyPair() {
-        // Fallback: no WebCrypto subtle (plain-HTTP non-localhost) or no KEM
-        // backend loaded -> delegate to Flask liboqs-python backend.
+        // No WebCrypto subtle → use server fallback.
         if (!hasSubtleCrypto()) {
             var response = await fetch("/generate-keys", { method: "POST" });
             if (!response.ok) {
@@ -450,7 +413,7 @@
         try {
             kem = await resolveKem();
         } catch (e) {
-            // KEM bundle missing (e.g. ml-kem.js failed to load): use server backend.
+            // KEM bundle not loaded → use server fallback.
             var fallback = await fetch("/generate-keys", { method: "POST" });
             if (!fallback.ok) {
                 var errFallback = await fallback.json().catch(function () { return {}; });
@@ -486,12 +449,13 @@
 
     /**
      * Hybrid PQC encryption for /set-message:
-     *   (kem_ciphertext, shared_secret) = Encap(recipient ML-KEM-768 public key)
-     *   aes_key = HKDF-SHA256(shared_secret)
-     *   ciphertext = AES-256-GCM(aes_key, iv=12 random bytes, file_bytes)
+     *   1. Encap(recipient pk) → (kem_ct, shared_secret)
+     *   2. aes_key = HKDF-SHA256(shared_secret)
+     *   3. ciphertext = AES-256-GCM(aes_key, random 12-byte IV, file)
+     * Returns { ciphertext, iv, encryptedKey } as base64 strings.
+     * Fallback: POSTs to /encrypt-file if crypto.subtle unavailable.
      */
     async function encryptFile(fileArrayBuffer, publicKeyPem, filename) {
-        // Server-side PQC fallback when WebCrypto subtle is unavailable.
         if (!hasSubtleCrypto()) {
             var formData = new FormData();
             formData.append("public_key_pem", publicKeyPem);
@@ -516,8 +480,7 @@
         }
 
         var aesKeyBytes = await deriveAesKey(sharedSecret);
-        // Clear shared secret as soon as the AES key is derived (hygiene).
-        sharedSecret.fill(0);
+        sharedSecret.fill(0); // Clear shared secret after AES key is derived.
 
         var aesKey = await importAesKeyForEncrypt(aesKeyBytes);
         var iv = crypto.getRandomValues(new Uint8Array(AES_GCM_IV_BYTES));
@@ -526,7 +489,7 @@
             ? fileArrayBuffer
             : new Uint8Array(fileArrayBuffer);
 
-        // WebCrypto AES-GCM returns ciphertext || 16-byte auth tag.
+        // AES-GCM output = ciphertext || 16-byte auth tag.
         var ciphertextBuffer = await crypto.subtle.encrypt(
             { name: "AES-GCM", iv: iv },
             aesKey,
@@ -544,13 +507,13 @@
 
     /**
      * Hybrid PQC decryption:
-     *   shared_secret = Decap(private ML-KEM-768 secret key, kem_ciphertext)
-     *   aes_key = HKDF-SHA256(shared_secret)
-     *   plaintext = AES-256-GCM-decrypt(aes_key, iv, ciphertext)
-     * The private key is only ever used inside the browser.
+     *   1. shared_secret = Decap(private sk, kem_ct)
+     *   2. aes_key = HKDF-SHA256(shared_secret)
+     *   3. plaintext = AES-256-GCM-decrypt(aes_key, iv, ciphertext)
+     * Private key is used only in-browser; never sent to server.
+     * Fallback: POSTs to /decrypt-file if crypto.subtle unavailable.
      */
     async function decryptFile(ciphertextBase64, ivBase64, encryptedKeyBase64, privateKeyPem) {
-        // Server-side PQC fallback when WebCrypto subtle is unavailable.
         if (!hasSubtleCrypto()) {
             var formData = new FormData();
             formData.append("private_key_pem", privateKeyPem);
@@ -600,6 +563,7 @@
         }
     }
 
+    /** Trigger a browser file download for given content (string or ArrayBuffer). */
     function downloadFile(filename, content, mimeType) {
         var blob = typeof content === "string"
             ? new Blob([content], { type: mimeType || "text/plain" })
@@ -615,7 +579,6 @@
     }
 
     window.ClassmateCrypto = {
-        // PQC identity (useful for feature detection / tests).
         kemAlgorithm: KEM_ALGORITHM,
         kemAlias: KEM_ALIAS_KYBER768,
         hkdfInfo: HKDF_INFO_STRING,
