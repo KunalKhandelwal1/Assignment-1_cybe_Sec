@@ -27,6 +27,14 @@ if (isNewDatabase) {
   if (!columns.includes("message_iv")) {
     db.exec("ALTER TABLE accounts ADD COLUMN message_iv TEXT");
   }
+
+  if (!columns.includes("message_encrypted_key")) {
+    db.exec("ALTER TABLE accounts ADD COLUMN message_encrypted_key TEXT");
+  }
+
+  if (!columns.includes("message_filename")) {
+    db.exec("ALTER TABLE accounts ADD COLUMN message_filename TEXT");
+  }
 }
 
 const seedAccounts = [
